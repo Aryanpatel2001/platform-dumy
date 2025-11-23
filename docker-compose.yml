@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: backend-container
+    ports:
+      - "3000:3000"
+    env_file:
+      - ./backend/.env
+    command: ["npm", "start"]
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: frontend-container
+    ports:
+      - "5173:80"   # frontend served by nginx
+    depends_on:
+      - backend
