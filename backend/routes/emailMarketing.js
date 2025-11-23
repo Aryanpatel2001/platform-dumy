@@ -10,6 +10,7 @@ import * as emailRepo from '../db/repositories/emailRepository.js';
 import { sendCampaignEmail, sendTestEmail, validateEmailConfig } from '../services/emailService.js';
 import { renderTemplate, renderSubject, htmlToPlainText, generateUnsubscribeLink, generatePreferencesLink } from '../services/templateService.js';
 import { generateSubjectLine, generateEmailContent, generateEmailCampaign } from '../services/emailContentGenerator.js';
+import { emailQueue } from '../services/emailQueue.js';
 
 const router = express.Router();
 
@@ -30,16 +31,16 @@ router.use((req, res, next) => {
 router.post('/webhook', async (req, res) => {
     try {
         const events = req.body;
-        
+
         // SendGrid sends an array of events
         if (Array.isArray(events)) {
             for (const event of events) {
                 const { email, event: eventType, timestamp, campaign_id, contact_id } = event;
-                
+
                 // Only process events with campaign_id (our custom arg)
                 if (campaign_id && contact_id) {
                     console.log(`Processing ${eventType} event for campaign ${campaign_id}`);
-                    
+
                     const updates = {};
                     const eventDate = new Date(timestamp * 1000).toISOString();
 
@@ -75,7 +76,7 @@ router.post('/webhook', async (req, res) => {
                         const recipient = await emailRepo.getCampaignRecipient(campaign_id, contact_id);
                         if (recipient) {
                             await emailRepo.updateCampaignRecipient(recipient.id, updates);
-                            
+
                             // Update campaign stats periodically or after key events
                             if (['open', 'click', 'bounce'].includes(eventType)) {
                                 await emailRepo.updateCampaignStats(campaign_id);
@@ -97,16 +98,16 @@ router.post('/webhook', async (req, res) => {
 router.post('/unsubscribe', async (req, res) => {
     try {
         const { contactId } = req.body;
-        
+
         if (!contactId) {
             return res.status(400).json({ error: true, message: 'Contact ID is required' });
         }
 
         await emailRepo.unsubscribeContact(contactId);
-        
-        res.json({ 
-            success: true, 
-            message: 'You have been unsubscribed successfully.' 
+
+        res.json({
+            success: true,
+            message: 'You have been unsubscribed successfully.'
         });
     } catch (error) {
         console.error('Unsubscribe error:', error);
@@ -299,116 +300,73 @@ router.post('/campaigns/:id/send', async (req, res) => {
                 campaignMetadata = null;
             }
         }
-        
+
         const isABTest = campaignMetadata && campaignMetadata.is_ab_test;
         const splitPercentage = isABTest ? (campaignMetadata.split_percentage || 50) : 100;
 
-        // Send emails (in production, use a queue system like Bull)
-        let sentCount = 0;
-        let failedCount = 0;
-        const totalContacts = uniqueContacts.length;
-        
-        console.log(`\n📧 Starting to send campaign "${campaign.name}" to ${totalContacts} contacts...`);
-        if (isABTest) {
-            console.log(`   A/B Test: ${splitPercentage}% to Variation A, ${100 - splitPercentage}% to Variation B\n`);
-        } else {
-            console.log();
-        }
-        
+        // Add jobs to queue
+        console.log(`\n📧 Queuing campaign "${campaign.name}" for ${uniqueContacts.length} contacts...`);
+
+        const jobs = [];
         for (let i = 0; i < uniqueContacts.length; i++) {
             const contact = uniqueContacts[i];
-            try {
-                console.log(`[${sentCount + failedCount + 1}/${totalContacts}] Sending email to Contact ID: ${contact.id}, Email: ${contact.email}...`);
-                
-                // Determine variation for A/B test
-                let variation = 'A';
-                let subjectToUse = campaign.subject;
-                let htmlToUse = htmlContent;
-                
-                if (isABTest) {
-                    // Split based on contact index (deterministic split)
-                    const splitPoint = Math.floor((totalContacts * splitPercentage) / 100);
-                    variation = i < splitPoint ? 'A' : 'B';
-                    
-                    if (variation === 'B') {
-                        subjectToUse = campaignMetadata.variation_b.subject;
-                        htmlToUse = campaignMetadata.variation_b.html_content;
-                    } else {
-                        subjectToUse = campaignMetadata.variation_a.subject;
-                        htmlToUse = campaignMetadata.variation_a.html_content;
-                    }
-                    
-                    console.log(`   Variation: ${variation}`);
-                }
-                
-                // Render personalized email
-                const html = renderTemplate(
-                    htmlToUse,
-                    contact,
-                    {
-                        name: campaign.name,
-                        unsubscribeLink: generateUnsubscribeLink(contact.id, baseUrl),
-                        preferencesLink: generatePreferencesLink(contact.id, baseUrl)
-                    }
-                );
-                const subject = renderSubject(subjectToUse, contact, { name: campaign.name });
-                const text = htmlToPlainText(html);
 
-                // Send email
-                const sendResult = await sendCampaignEmail({
-                    to: contact.email,
-                    subject,
-                    html,
-                    text,
-                    from: campaign.from_email,
-                    fromName: campaign.from_name,
-                    replyTo: campaign.reply_to,
-                    campaignId: campaign.id,
-                    contactId: contact.id
-                });
+            // Determine variation for A/B test (pre-calculate for worker)
+            let subjectToUse = campaign.subject;
+            let htmlToUse = htmlContent;
 
-                // Create recipient record
-                await emailRepo.createCampaignRecipient(campaign.id, contact.id, 'sent');
-                sentCount++;
-                
-                console.log(`✅ SUCCESS - Email sent to Contact ID: ${contact.id} (${contact.email})`);
-                if (sendResult.messageId) {
-                    console.log(`   Message ID: ${sendResult.messageId}`);
-                }
+            if (isABTest) {
+                const splitPoint = Math.floor((uniqueContacts.length * splitPercentage) / 100);
+                const variation = i < splitPoint ? 'A' : 'B';
 
-                // Small delay to avoid rate limiting
-                await new Promise(resolve => setTimeout(resolve, 100));
-            } catch (error) {
-                failedCount++;
-                console.error(`❌ FAILED - Email NOT sent to Contact ID: ${contact.id} (${contact.email})`);
-                console.error(`   Error: ${error.message}`);
-                if (error.response) {
-                    console.error(`   SendGrid Error Details:`, error.response.body);
+                if (variation === 'B') {
+                    subjectToUse = campaignMetadata.variation_b.subject;
+                    htmlToUse = campaignMetadata.variation_b.html_content;
+                } else {
+                    subjectToUse = campaignMetadata.variation_a.subject;
+                    htmlToUse = campaignMetadata.variation_a.html_content;
                 }
-                // Continue with next contact
             }
-        }
-        
-        console.log(`\n📊 Campaign Send Summary:`);
-        console.log(`   ✅ Successfully sent: ${sentCount}/${totalContacts}`);
-        console.log(`   ❌ Failed: ${failedCount}/${totalContacts}`);
-        console.log(`   📧 Campaign ID: ${campaign.id}\n`);
 
-        // Update campaign status
-        await emailRepo.updateCampaign(req.params.id, req.user.id, {
-            status: 'sent',
-            sent_at: new Date().toISOString(),
-            total_sent: sentCount
-        });
+            // Create job data - passing campaign object and specific content
+            // We create a modified campaign object for the worker to use the correct subject
+            const jobCampaign = {
+                ...campaign,
+                subject: subjectToUse,
+                from_email: campaign.from_email,
+                from_name: campaign.from_name,
+                reply_to: campaign.reply_to
+            };
+
+            const job = await emailQueue.add('send-email', {
+                campaignId: campaign.id,
+                contactId: contact.id,
+                contact,
+                campaign: jobCampaign,
+                htmlContent: htmlToUse,
+                baseUrl
+            }, {
+                priority: 1,
+                removeOnComplete: true,
+                attempts: 3
+            });
+
+            jobs.push(job.id);
+        }
 
         res.json({
             success: true,
-            message: `Campaign sent to ${sentCount} recipients`,
-            sent: sentCount,
-            total: uniqueContacts.length
+            message: `Campaign queued successfully. ${jobs.length} emails will be sent in the background.`,
+            campaignId: campaign.id,
+            jobCount: jobs.length
         });
+
     } catch (error) {
         console.error('Send campaign error:', error);
+        // If updating status failed, try to revert
+        try {
+            await emailRepo.updateCampaign(req.params.id, req.user.id, { status: 'failed' });
+        } catch (e) { }
         res.status(500).json({ error: true, message: error.message });
     }
 });
@@ -619,7 +577,7 @@ router.post('/contacts/import', async (req, res) => {
         }
 
         const Papa = (await import('papaparse')).default;
-        
+
         const parseResult = Papa.parse(csvData, {
             header: true,
             skipEmptyLines: true,
@@ -628,7 +586,7 @@ router.post('/contacts/import', async (req, res) => {
                 const normalized = header.trim().toLowerCase()
                     .replace(/\s+/g, '_')
                     .replace(/[^a-z0-9_]/g, '');
-                
+
                 // Map common variations
                 const mapping = {
                     'email': 'email',
@@ -667,7 +625,7 @@ router.post('/contacts/import', async (req, res) => {
 
         // Validate required fields
         const requiredFields = ['email'];
-        const missingFields = requiredFields.filter(field => 
+        const missingFields = requiredFields.filter(field =>
             !rows[0].hasOwnProperty(field)
         );
 
@@ -734,13 +692,13 @@ router.post('/contacts/import', async (req, res) => {
 router.get('/contacts/export', async (req, res) => {
     try {
         const contacts = await emailRepo.getContactsByUser(req.user.id, req.query);
-        
+
         if (contacts.length === 0) {
             return res.status(404).json({ error: true, message: 'No contacts to export' });
         }
 
         const Papa = (await import('papaparse')).default;
-        
+
         // Prepare data for CSV
         const csvData = contacts.map(contact => ({
             email: contact.email || '',
@@ -911,7 +869,7 @@ router.get('/lists/:id/contacts', async (req, res) => {
 router.post('/ai/generate-subject', async (req, res) => {
     try {
         const { prompt } = req.body;
-        
+
         if (!prompt || prompt.trim() === '') {
             return res.status(400).json({ error: true, message: 'Prompt is required' });
         }
@@ -928,7 +886,7 @@ router.post('/ai/generate-subject', async (req, res) => {
 router.post('/ai/generate-content', async (req, res) => {
     try {
         const { prompt } = req.body;
-        
+
         if (!prompt || prompt.trim() === '') {
             return res.status(400).json({ error: true, message: 'Prompt is required' });
         }
@@ -945,7 +903,7 @@ router.post('/ai/generate-content', async (req, res) => {
 router.post('/ai/generate-campaign', async (req, res) => {
     try {
         const { prompt } = req.body;
-        
+
         if (!prompt || prompt.trim() === '') {
             return res.status(400).json({ error: true, message: 'Prompt is required' });
         }
@@ -968,9 +926,9 @@ router.post('/campaigns/ab-test', async (req, res) => {
         const { name, subject_a, subject_b, html_content_a, html_content_b, split_percentage } = req.body;
 
         if (!name || !subject_a || !subject_b || !html_content_a || !html_content_b) {
-            return res.status(400).json({ 
-                error: true, 
-                message: 'Name, subject_a, subject_b, html_content_a, and html_content_b are required' 
+            return res.status(400).json({
+                error: true,
+                message: 'Name, subject_a, subject_b, html_content_a, and html_content_b are required'
             });
         }
 

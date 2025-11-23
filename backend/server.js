@@ -157,16 +157,20 @@ async function startServer() {
   setupVoiceGateway(httpServer);
 
   // =========================================================================
-  // EMAIL CAMPAIGN SCHEDULER
+  // EMAIL CAMPAIGN SCHEDULER & WORKER
   // =========================================================================
   // Features:
   // - Checks for scheduled campaigns every minute
   // - Automatically sends campaigns at scheduled time
-  // - Handles campaign status updates
+  // - Background processing of email sending via Redis queue
   // =========================================================================
 
   if (dbInitialized) {
     startCampaignScheduler();
+    // Start email worker for queue processing
+    import('./services/emailWorker.js').then(({ startEmailWorker }) => {
+      startEmailWorker();
+    }).catch(err => console.error('Failed to start email worker:', err));
   }
 }
 
